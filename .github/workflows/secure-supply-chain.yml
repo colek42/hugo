@@ -20,7 +20,7 @@ permissions:
 
 env:
   CILOCK_URL: https://github.com/colek42/hugo/releases/download/cilock-demo/cilock-linux-amd64
-  CILOCK_SHA256: d02673747b31658696f1dc8ade5eead62b5702fd7dec999fee33661122e7b226
+  CILOCK_SHA256: ab379b64eb7fd873b6e384624b774db02fa3ccce4c86784cb8364cec995a65b6
 
 jobs:
   secure-build:
@@ -118,6 +118,13 @@ jobs:
       # grants CAP_BPF/CAP_SYS_ADMIN on the hosted runner; cilock drops the
       # tracee back to the runner uid before exec. --diagnose surfaces eBPF
       # program-loading + ringbuf logs.
+      #
+      # One step, two products: this single traced operation produces BOTH the
+      # binary and its SBOM. cilock anchors products on exists-at-exit + mtime,
+      # so hugo-bin is captured even though syft reads it back, and
+      # hugo-bin.cdx.json is captured even if the eBPF write-tap drops its
+      # write event (Azure 6.17). fanotify (default on) gives a zero-drop
+      # guarantee for reads/materials.
       - name: 'Stage: build (eBPF-traced)'
         run: |
           set -euo pipefail
