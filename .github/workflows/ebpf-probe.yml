@@ -1,0 +1,50 @@
+name: ebpf-probe
+
+# Minimal, fast feedback loop for the eBPF loader on the hosted runner kernel.
+# No Hugo build, no Docker — just install the toolchain and exercise
+# cilock's trace:ebpf load/rebuild path against a trivial command.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ebpf-probe]
+
+permissions:
+  contents: read
+
+env:
+  CILOCK_URL: https://github.com/colek42/hugo/releases/download/cilock-demo/cilock-linux-amd64
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kernel
+        run: uname -r
+
+      - name: Install eBPF toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common linux-tools-generic
+          ls -la /usr/lib/linux-tools-*/bpftool || true
+
+      - name: Get cilock
+        run: |
+          set -euo pipefail
+          curl -fsSL -o cilock "$CILOCK_URL"
+          chmod +x cilock
+          sudo mv cilock /usr/local/bin/cilock
+          cilock version
+
+      - name: Probe eBPF load
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null k.key
+          printf '%s' "${{ secrets.CILOCK_SIGNING_KEY }}" > k.key
+          sudo env "PATH=$PATH" "HOME=$HOME" \
+            cilock run --step probe --workload manual \
+              --trace --capture-mode trace:ebpf --diagnose \
+              -a environment -k k.key -o probe.att.json \
+              -- bash -c 'echo hello > /tmp/ebpf-probe-out.txt'
+          echo "=== eBPF probe succeeded — trace:ebpf loaded and captured ==="
