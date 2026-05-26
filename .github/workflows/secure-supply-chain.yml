@@ -62,11 +62,23 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common linux-tools-generic
           sudo apt-get install -y "linux-tools-$(uname -r)" || true
-          # Standalone bpftool as a fallback if the kernel-specific package is absent.
-          command -v bpftool || sudo apt-get install -y bpftool || true
+          # Ubuntu's /usr/sbin/bpftool is a version-dispatch WRAPPER that refuses
+          # to run unless the per-running-kernel linux-tools package is present —
+          # which doesn't exist in apt for the hosted runner's azure kernel. The
+          # linux-tools-generic package ships a REAL bpftool binary that can dump
+          # /sys/kernel/btf/vmlinux regardless of running kernel. Shadow the
+          # wrapper with it so cilock's rebuild-from-source path works.
+          REAL_BPFTOOL="$(find /usr/lib/linux-tools-* -maxdepth 1 -name bpftool -type f 2>/dev/null | sort -V | tail -1 || true)"
+          echo "real bpftool: ${REAL_BPFTOOL:-<none found>}"
+          if [ -n "${REAL_BPFTOOL:-}" ]; then
+            sudo ln -sf "$REAL_BPFTOOL" /usr/local/sbin/bpftool
+            sudo ln -sf "$REAL_BPFTOOL" /usr/sbin/bpftool
+          fi
+          echo "=== bpftool sanity ==="
           bpftool version || true
+          bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null | head -3 || echo "btf dump failed"
           clang --version | head -1 || true
 
       # SSDF PS.2 — the release-integrity signing key. File signer for this
