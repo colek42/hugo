@@ -1,0 +1,140 @@
+name: secure-supply-chain
+
+# A full NIST SP 800-204D / SSDF (SP 800-218) supply-chain pipeline for Hugo,
+# attested end-to-end with cilock. Each stage emits a signed attestation; the
+# final stage is a cryptographic verification GATE against a pre-committed,
+# signed Witness policy.
+#
+# The build stage captures its materials/products with the eBPF tracer
+# (--capture-mode trace:ebpf), not a filesystem walk: cilock runs under sudo so
+# it can load BPF + fanotify on the GitHub-hosted runner, and drops the tracee
+# back to the unprivileged runner uid before exec.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [cilock-pipeline]
+
+permissions:
+  contents: read
+
+env:
+  CILOCK_URL: https://github.com/colek42/hugo/releases/download/cilock-demo/cilock-linux-amd64
+  CILOCK_SHA256: 700e4d3bb7194adea2565d71fadb125450f6df05c8a0b25d51d64f03496bff15
+
+jobs:
+  secure-build:
+    runs-on: ubuntu-latest
+    steps:
+      # SSDF PS.1 — protect source from tampering: actions/checkout pins the
+      # commit; the source stage below attests exactly what we built from.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      # Supply chain for the tooling itself: cilock is pinned by URL + sha256.
+      - name: Install cilock (pinned + checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o cilock "$CILOCK_URL"
+          echo "${CILOCK_SHA256}  cilock" | sha256sum -c -
+          chmod +x cilock
+          sudo mv cilock /usr/local/bin/cilock
+          cilock version
+
+      - name: Install supply-chain tools (syft, govulncheck)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # SSDF PS.2 — the release-integrity signing key. File signer for this
+      # demo; keyless Fulcio/OIDC + Archivista is the production path.
+      - name: Provision signing key
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null cilock.key
+          printf '%s' "${{ secrets.CILOCK_SIGNING_KEY }}" > cilock.key
+
+      # ── SSDF PO.3 / PS.1 — source provenance ────────────────────────────
+      - name: 'Stage: source provenance'
+        run: |
+          cilock run --step source --workload manual \
+            -a environment,git -k cilock.key -o source.att.json \
+            -- git rev-parse HEAD
+
+      # ── SSDF PW.4 — well-secured components: dependency SBOM ─────────────
+      - name: 'Stage: dependency SBOM'
+        run: |
+          cilock run --step sbom --workload manual \
+            -a environment,git,sbom -k cilock.key -o sbom.att.json \
+            -- syft scan dir:. -o cyclonedx-json=hugo-source.cdx.json -q
+
+      # ── SSDF RV.1 / PW.8 — vulnerability identification ──────────────────
+      # govulncheck is allowed to report findings without failing the pipeline;
+      # the attestation records the result either way (gate on it in policy).
+      - name: 'Stage: vulnerability scan'
+        run: |
+          cilock run --step vuln-scan --workload manual \
+            -a environment,git,govulncheck -k cilock.key -o vuln-scan.att.json \
+            -- bash -c 'govulncheck -format json ./common/... > govulncheck.json 2>/dev/null || true'
+
+      # ── SSDF PW.6 / PS.1 — build with eBPF material capture ──────────────
+      # THE headline: --capture-mode trace:ebpf forces the eBPF backend and
+      # fails loudly if it can't load (no silent ptrace/walk fallback). sudo
+      # grants CAP_BPF/CAP_SYS_ADMIN on the hosted runner; cilock drops the
+      # tracee back to the runner uid before exec. --diagnose surfaces eBPF
+      # program-loading + ringbuf logs.
+      - name: 'Stage: build (eBPF-traced)'
+        run: |
+          set -euo pipefail
+          sudo env "PATH=$PATH" "HOME=$HOME" \
+            cilock run --step build --workload manual \
+              --trace --capture-mode trace:ebpf --hardening standard --diagnose \
+              -a environment,git,go-build,slsa,sbom -k cilock.key -o build.att.json \
+              -- bash -c 'go build -o hugo-bin . && syft scan hugo-bin -o cyclonedx-json=hugo-bin.cdx.json -q'
+          sudo chown -R "$(id -un):$(id -gn)" .
+
+      # ── SSDF PW.6 — container build provenance ───────────────────────────
+      - name: 'Stage: container build'
+        run: |
+          cilock run --step container --workload manual \
+            -a environment,git,docker -k cilock.key -o container.att.json \
+            -- docker buildx build -t hugo:ci --load \
+               --metadata-file docker-meta.json --iidfile docker-iid.txt .
+
+      # ── SSDF PS.2 — verification GATE against the signed policy ──────────
+      # Fails the pipeline if any required attestation is missing, unsigned by
+      # the trusted key, or if the subject binary doesn't match the attested
+      # product. This is the admission decision.
+      - name: 'Gate: verify against signed policy'
+        run: |
+          set -euo pipefail
+          cilock verify \
+            -p .cilock/policy.signed.json \
+            -k .cilock/cilock-signing.pub \
+            -a source.att.json \
+            -a sbom.att.json \
+            -a vuln-scan.att.json \
+            -a build.att.json \
+            -a container.att.json \
+            -f hugo-bin \
+            --platform-url ""
+
+      - name: Upload attestations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cilock-attestations
+          path: |
+            *.att.json
+            *.att.*.tree.json
+            *.cdx.json
+            govulncheck.json
+            docker-meta.json
