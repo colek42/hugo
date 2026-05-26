@@ -54,6 +54,21 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
+      # cilock's eBPF objects are CO-RE; on a bleeding-edge runner kernel some
+      # kprobe relocations don't resolve against the prebuilt objects, so
+      # cilock falls back to rebuilding the BPF from source against the live
+      # kernel BTF. That path needs bpftool (BTF dump) + clang/llvm (recompile).
+      - name: Install eBPF toolchain (bpftool, clang, llvm)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common
+          sudo apt-get install -y "linux-tools-$(uname -r)" || true
+          # Standalone bpftool as a fallback if the kernel-specific package is absent.
+          command -v bpftool || sudo apt-get install -y bpftool || true
+          bpftool version || true
+          clang --version | head -1 || true
+
       # SSDF PS.2 — the release-integrity signing key. File signer for this
       # demo; keyless Fulcio/OIDC + Archivista is the production path.
       - name: Provision signing key
