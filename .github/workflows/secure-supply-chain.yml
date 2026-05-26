@@ -35,6 +35,10 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+          # Disable the build-cache restore so every run is a COLD full
+          # compile — makes the eBPF capture comparable run-to-run instead
+          # of being swamped by cache-warmth variance.
+          cache: false
 
       # Supply chain for the tooling itself: cilock is pinned by URL + sha256.
       - name: Install cilock (pinned + checksum-verified)
@@ -132,7 +136,7 @@ jobs:
             cilock run --step build --workload manual \
               --trace --capture-mode trace:ebpf --hardening standard --diagnose \
               -a environment,git,go-build,slsa,sbom -k cilock.key -o build.att.json \
-              -- bash -c 'go build -o hugo-bin . && syft scan hugo-bin -o cyclonedx-json=hugo-bin.cdx.json -q'
+              -- bash -c 'go build -trimpath -ldflags=-buildid= -o hugo-bin . && syft scan hugo-bin -o cyclonedx-json=hugo-bin.cdx.json -q'
           sudo chown -R "$(id -un):$(id -gn)" .
 
       # ── SSDF PW.6 — container build provenance ───────────────────────────
