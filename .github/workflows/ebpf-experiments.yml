@@ -1,0 +1,125 @@
+name: ebpf-experiments
+
+# Ablation matrix to determine which product-capture path is load-bearing on
+# the Azure runner (lossy eBPF write-tap), whether zero-drops passes, and the
+# overhead of FAN_CLOSE_WRITE. Each cell does a COLD Hugo build+SBOM under
+# trace:ebpf with a different capture configuration and records the product
+# tree, timing, and diagnostics.
+#
+# Build produces TWO product shapes on purpose:
+#   - hugo-bin           : created by atomic RENAME (/tmp/a.out -> hugo-bin),
+#                          so FAN_CLOSE_WRITE does NOT fire for it (rename
+#                          target is never write-closed in-workspace).
+#   - hugo-bin.cdx.json  : DIRECT write by syft, so FAN_CLOSE_WRITE fires.
+# This lets us see which mechanism carries which product shape.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ebpf-experiments]
+
+permissions:
+  contents: read
+
+env:
+  CILOCK_URL: https://github.com/colek42/hugo/releases/download/cilock-demo/cilock-linux-amd64
+  CILOCK_SHA256: 0c53fb49099407abcaa8fdda2c89210a442dc6ecda4ee7091a37ed9d9a2cc5a9
+
+jobs:
+  experiment:
+    name: ${{ matrix.cell.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cell:
+          - { name: baseline,          fanotify: "1",   disable_survivor: "",  hardening: standard }
+          - { name: fano-no-survivor,  fanotify: "1",   disable_survivor: "1", hardening: standard }
+          - { name: survivor-no-fano,  fanotify: "off", disable_survivor: "",  hardening: standard }
+          - { name: writetap-only,     fanotify: "off", disable_survivor: "1", hardening: standard }
+          - { name: strict-zero-drops, fanotify: "1",   disable_survivor: "",  hardening: strict   }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26', cache: false }
+
+      - name: Install cilock (pinned)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o cilock "$CILOCK_URL"
+          echo "${CILOCK_SHA256}  cilock" | sha256sum -c -
+          chmod +x cilock && sudo mv cilock /usr/local/bin/cilock && cilock version
+
+      - name: Install tools (syft + eBPF toolchain)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libbpf-dev linux-tools-common linux-tools-generic
+          REAL_BPFTOOL="$(find /usr/lib/linux-tools-* -maxdepth 1 -name bpftool -type f 2>/dev/null | sort -V | tail -1 || true)"
+          [ -n "${REAL_BPFTOOL:-}" ] && { sudo ln -sf "$REAL_BPFTOOL" /usr/local/sbin/bpftool; sudo ln -sf "$REAL_BPFTOOL" /usr/sbin/bpftool; } || true
+
+      - name: Provision key
+        run: |
+          install -m 600 /dev/null cilock.key
+          printf '%s' "${{ secrets.CILOCK_SIGNING_KEY }}" > cilock.key
+
+      - name: 'Experiment: cold build under trace:ebpf'
+        id: run
+        run: |
+          set -uo pipefail
+          START=$(date +%s.%N)
+          sudo env "PATH=$PATH" "HOME=$HOME" \
+            "CILOCK_FANOTIFY=${{ matrix.cell.fanotify }}" \
+            "CILOCK_DEV_DISABLE_SURVIVOR_WALK=${{ matrix.cell.disable_survivor }}" \
+            cilock run --step build --workload manual \
+              --trace --capture-mode trace:ebpf --hardening ${{ matrix.cell.hardening }} \
+              -a environment,git,go-build,slsa,sbom -k cilock.key -o build.att.json \
+              -- bash -c 'go build -trimpath -ldflags=-buildid= -o hugo-bin . && syft scan hugo-bin -o cyclonedx-json=hugo-bin.cdx.json -q'
+          RC=$?
+          END=$(date +%s.%N)
+          echo "cilock_exit=$RC" >> "$GITHUB_OUTPUT"
+          echo "wall_seconds=$(awk "BEGIN{printf \"%.1f\", $END-$START}")" >> "$GITHUB_OUTPUT"
+          sudo chown -R "$(id -un):$(id -gn)" . || true
+
+      - name: Analyze
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, base64, os
+          cell = "${{ matrix.cell.name }}"
+          rc = "${{ steps.run.outputs.cilock_exit }}"
+          wall = "${{ steps.run.outputs.wall_seconds }}"
+          res = {"cell": cell, "cilock_exit": rc, "wall_seconds": wall}
+          try:
+              d = json.load(open("build.att.json")); p = json.loads(base64.b64decode(d["payload"]))
+              ats = {a["type"]: a["attestation"] for a in p["predicate"]["attestations"]}
+              pr = ats.get("https://aflock.ai/attestations/product/v0.3", {})
+              res["product_treeSize"] = pr.get("treeSize")
+              cr = ats.get("https://aflock.ai/attestations/command-run/v0.1", {})
+              s = cr.get("summary", {})
+              res["diagnostics"] = s.get("diagnostics", {})
+              res["bytesHashed"] = s.get("diagnostics", {}).get("bytesHashed")
+          except Exception as e:
+              res["att_error"] = str(e)
+          leaves = []
+          try:
+              t = json.load(open("build.att.product.tree.json"))
+              leaves = sorted(l["path"].split("/")[-1] for l in t["leaves"])
+          except Exception:
+              pass
+          res["product_leaves"] = leaves
+          res["has_hugo_bin"] = "hugo-bin" in leaves
+          res["has_cdx"] = "hugo-bin.cdx.json" in leaves
+          json.dump(res, open(f"result-{cell}.json","w"), indent=2)
+          print(json.dumps(res, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
+              f.write(f"## {cell}\n```\n{json.dumps(res, indent=2)}\n```\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.cell.name }}
+          path: result-${{ matrix.cell.name }}.json
+          if-no-files-found: warn
