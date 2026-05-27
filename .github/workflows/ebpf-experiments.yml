@@ -1,21 +1,15 @@
 name: ebpf-experiments
 
-# Experiment matrix for the fanotify/eBPF capture optimizations. Each cell
-# does a COLD Hugo build+SBOM under trace:ebpf and records timing + the
-# fanotify/eBPF diagnostics, so we can measure on the REAL Azure runner what
-# the local colima VM already showed:
+# Write-tap ablation on the real Azure runner. read-tap is already off by
+# default (proven net-negative). This run answers: is the WRITE-tap also
+# redundant for PRODUCTS, so the whole shared read_tap_events subsystem can
+# be deleted? Hugo emits two product shapes — hugo-bin (atomic rename) and
+# hugo-bin.cdx.json (direct write) — and the analyze step records each
+# product leaf's digest so we can confirm write-tap-off captures BOTH with
+# identical content (fanotify FAN_CLOSE_WRITE + survivor-walk + exists-at-exit).
+# Confirmed locally (digest-verified); this is the real-target check.
 #
-#   - ignore-once (FAN_MARK_IGNORE per inode, "hash each inode once") is now
-#     DEFAULT ON. The `ignore_off` cell disables it for the A/B delta.
-#   - unlimited-queue (FAN_UNLIMITED_QUEUE) was a no-op locally (0 overflows
-#     at 4 vCPU); this is where we find out if the heavier Hugo build on a
-#     hosted runner actually overflows the 16384-event queue.
-#   - ringbuf-resize: the compiled-in ringbufs are 256MiB + 1GiB; the
-#     `ringbuf_small` cell shrinks them to prove the knob + check drops.
-#   - strict_zero_drops: does ignore-once let --require-zero-drops pass here?
-#
-# A Phase-0 probe step records the runtime kernel facts the research left
-# unverified (kernel version, active LSM list, IMA, FS type, caps).
+# A Phase-0 probe step records runtime kernel facts (kernel, LSM, IMA, FS, caps).
 
 on:
   workflow_dispatch:
@@ -27,7 +21,7 @@ permissions:
 
 env:
   CILOCK_URL: https://github.com/colek42/hugo/releases/download/cilock-demo/cilock-linux-amd64
-  CILOCK_SHA256: dc1df016d29bbbcd247d62ac6ec345dffb5d16ea7303dbe45b53f665c0ef88fd
+  CILOCK_SHA256: bdb8b4778946dccfa93810ed85ee72dc3d3fcc3a1cdeb76a77b168c745fd0f8a
 
 jobs:
   experiment:
@@ -37,13 +31,15 @@ jobs:
       fail-fast: false
       matrix:
         cell:
-          # Read-tap ablation (ignore-once default-on in both). Tests whether
-          # the eBPF read-tap is net-negative: local runs showed it adds ~93%
-          # cache/temp NOISE to materials + non-determinism + partial-read
-          # fallbacks + the 1GiB ring, for ~27 legit GOROOT mmap reads.
-          # readtap: ""=on (default), "off"=disabled.
-          - { name: readtap_on,  readtap: "" }
-          - { name: readtap_off, readtap: "off" }
+          # Write-tap ablation: read-tap is now off by default; test whether
+          # the write-tap is ALSO redundant for PRODUCTS (Hugo emits two
+          # shapes: hugo-bin via atomic rename, hugo-bin.cdx.json via direct
+          # write). Hypothesis (confirmed locally, digest-verified): fanotify
+          # FAN_CLOSE_WRITE + survivor-walk + exists-at-exit capture both with
+          # correct content, so write-tap can be deleted with the whole
+          # shared read_tap_events ring. writetap: ""=on, "off"=disabled.
+          - { name: writetap_on,  writetap: "" }
+          - { name: writetap_off, writetap: "off" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -91,7 +87,7 @@ jobs:
         run: |
           set -uo pipefail
           ENVV=( "PATH=$PATH" "HOME=$HOME" )
-          [ -n "${{ matrix.cell.readtap }}" ] && ENVV+=( "CILOCK_EBPF_READTAP=${{ matrix.cell.readtap }}" )
+          [ -n "${{ matrix.cell.writetap }}" ] && ENVV+=( "CILOCK_EBPF_WRITETAP=${{ matrix.cell.writetap }}" )
           START=$(date +%s.%N)
           sudo env "${ENVV[@]}" \
             cilock run --step build --workload manual \
@@ -127,22 +123,15 @@ jobs:
               res["diagnostics"] = {k: diag.get(k, 0) for k in keys}
           except Exception as e:
               res["att_error"] = str(e)
-          # Categorize the material leaves so we can see whether the read-tap
-          # is adding legit inputs or cache/temp NOISE.
+          # Products are the load-bearing artifacts: capture leaf path→digest
+          # so we can confirm write-tap-off still produces BOTH Hugo product
+          # shapes with the SAME content.
           try:
-              t = json.load(open("build.att.material.tree.json"))
-              import collections
-              cat = collections.Counter()
-              for lf in t.get("leaves", []):
-                  x = lf.get("path","")
-                  if "/pkg/mod/" in x or "/go-build" in x or "/.cache/" in x: cat["gocache_modcache"] += 1
-                  elif x.startswith("/tmp/"): cat["tmp"] += 1
-                  elif x.startswith("/proc/") or x.startswith("/sys/"): cat["procsys"] += 1
-                  elif "/go/" in x or x.endswith(".go") or "/pkg/include/" in x: cat["goroot_src"] += 1
-                  else: cat["other"] += 1
-              res["material_categories"] = dict(cat)
+              t = json.load(open("build.att.product.tree.json"))
+              res["product_leaves"] = {lf["path"].split("/")[-1]: lf.get("fileDigest")
+                                       for lf in t.get("leaves", [])}
           except Exception as e:
-              res["material_cat_error"] = str(e)
+              res["product_leaves_error"] = str(e)
           json.dump(res, open(f"result-{cell}.json","w"), indent=2)
           print(json.dumps(res, indent=2))
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
