@@ -1,17 +1,21 @@
 name: ebpf-experiments
 
-# Ablation matrix to determine which product-capture path is load-bearing on
-# the Azure runner (lossy eBPF write-tap), whether zero-drops passes, and the
-# overhead of FAN_CLOSE_WRITE. Each cell does a COLD Hugo build+SBOM under
-# trace:ebpf with a different capture configuration and records the product
-# tree, timing, and diagnostics.
+# Experiment matrix for the fanotify/eBPF capture optimizations. Each cell
+# does a COLD Hugo build+SBOM under trace:ebpf and records timing + the
+# fanotify/eBPF diagnostics, so we can measure on the REAL Azure runner what
+# the local colima VM already showed:
 #
-# Build produces TWO product shapes on purpose:
-#   - hugo-bin           : created by atomic RENAME (/tmp/a.out -> hugo-bin),
-#                          so FAN_CLOSE_WRITE does NOT fire for it (rename
-#                          target is never write-closed in-workspace).
-#   - hugo-bin.cdx.json  : DIRECT write by syft, so FAN_CLOSE_WRITE fires.
-# This lets us see which mechanism carries which product shape.
+#   - ignore-once (FAN_MARK_IGNORE per inode, "hash each inode once") is now
+#     DEFAULT ON. The `ignore_off` cell disables it for the A/B delta.
+#   - unlimited-queue (FAN_UNLIMITED_QUEUE) was a no-op locally (0 overflows
+#     at 4 vCPU); this is where we find out if the heavier Hugo build on a
+#     hosted runner actually overflows the 16384-event queue.
+#   - ringbuf-resize: the compiled-in ringbufs are 256MiB + 1GiB; the
+#     `ringbuf_small` cell shrinks them to prove the knob + check drops.
+#   - strict_zero_drops: does ignore-once let --require-zero-drops pass here?
+#
+# A Phase-0 probe step records the runtime kernel facts the research left
+# unverified (kernel version, active LSM list, IMA, FS type, caps).
 
 on:
   workflow_dispatch:
@@ -23,7 +27,7 @@ permissions:
 
 env:
   CILOCK_URL: https://github.com/colek42/hugo/releases/download/cilock-demo/cilock-linux-amd64
-  CILOCK_SHA256: 0c53fb49099407abcaa8fdda2c89210a442dc6ecda4ee7091a37ed9d9a2cc5a9
+  CILOCK_SHA256: 47212bf267bba07701c8134047d06738043ef284258c98b6dd52e20205d0fd30
 
 jobs:
   experiment:
@@ -33,15 +37,33 @@ jobs:
       fail-fast: false
       matrix:
         cell:
-          - { name: baseline,          fanotify: "1",   disable_survivor: "",  hardening: standard }
-          - { name: fano-no-survivor,  fanotify: "1",   disable_survivor: "1", hardening: standard }
-          - { name: survivor-no-fano,  fanotify: "off", disable_survivor: "",  hardening: standard }
-          - { name: writetap-only,     fanotify: "off", disable_survivor: "1", hardening: standard }
-          - { name: strict-zero-drops, fanotify: "1",   disable_survivor: "",  hardening: strict   }
+          # ignore_once: ""=default-on, "0"=disabled. unlimited: ""/"1".
+          # ev/rt ringbuf bytes: ""=compiled-in. zero_drops: ""/"--require-zero-drops".
+          - { name: default,           ignore_once: "",  unlimited: "",  ev: "", rt: "", hardening: standard, zero_drops: "" }
+          - { name: ignore_off,        ignore_once: "0", unlimited: "",  ev: "", rt: "", hardening: standard, zero_drops: "" }
+          - { name: unlimited_q,       ignore_once: "",  unlimited: "1", ev: "", rt: "", hardening: standard, zero_drops: "" }
+          - { name: ringbuf_small,     ignore_once: "",  unlimited: "",  ev: "16777216", rt: "67108864", hardening: standard, zero_drops: "" }
+          - { name: strict_zero_drops, ignore_once: "",  unlimited: "1", ev: "", rt: "", hardening: strict,   zero_drops: "--require-zero-drops" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: '1.26', cache: false }
+
+      # Phase 0 — record the runtime kernel reality the research couldn't
+      # confirm without a live runner. Cheap, always runs.
+      - name: 'Probe: runner kernel reality'
+        if: always()
+        run: |
+          echo "## probe (${{ matrix.cell.name }})" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "uname: $(uname -r)"
+            echo "lsm: $(cat /sys/kernel/security/lsm 2>&1)"
+            echo "ima dir: $(ls /sys/kernel/security/ima/ 2>&1 | tr '\n' ' ')"
+            echo "btf: $(ls -l /sys/kernel/btf/vmlinux 2>&1 | awk '{print $5}')"
+            echo "workspace fs: $(df -T . | tail -1)"
+            echo "nproc: $(nproc)  mem: $(free -h | awk '/Mem:/{print $2}')"
+            echo "caps: $(grep CapEff /proc/self/status 2>&1)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Install cilock (pinned)
         run: |
@@ -68,12 +90,17 @@ jobs:
         id: run
         run: |
           set -uo pipefail
+          # Build the per-cell env list, omitting empties so unset means
+          # "cilock default" (ignore-once on, unlimited off, compiled-in ringbufs).
+          ENVV=( "PATH=$PATH" "HOME=$HOME" )
+          [ -n "${{ matrix.cell.ignore_once }}" ] && ENVV+=( "CILOCK_FANO_IGNORE_ONCE=${{ matrix.cell.ignore_once }}" )
+          [ -n "${{ matrix.cell.unlimited }}" ]   && ENVV+=( "CILOCK_FANO_UNLIMITED_QUEUE=${{ matrix.cell.unlimited }}" )
+          [ -n "${{ matrix.cell.ev }}" ]          && ENVV+=( "CILOCK_EBPF_EVENTS_RINGBUF_BYTES=${{ matrix.cell.ev }}" )
+          [ -n "${{ matrix.cell.rt }}" ]          && ENVV+=( "CILOCK_EBPF_READTAP_RINGBUF_BYTES=${{ matrix.cell.rt }}" )
           START=$(date +%s.%N)
-          sudo env "PATH=$PATH" "HOME=$HOME" \
-            "CILOCK_FANOTIFY=${{ matrix.cell.fanotify }}" \
-            "CILOCK_DEV_DISABLE_SURVIVOR_WALK=${{ matrix.cell.disable_survivor }}" \
+          sudo env "${ENVV[@]}" \
             cilock run --step build --workload manual \
-              --trace --capture-mode trace:ebpf --hardening ${{ matrix.cell.hardening }} \
+              --trace --capture-mode trace:ebpf --hardening ${{ matrix.cell.hardening }} ${{ matrix.cell.zero_drops }} \
               -a environment,git,go-build,slsa,sbom -k cilock.key -o build.att.json \
               -- bash -c 'go build -trimpath -ldflags=-buildid= -o hugo-bin . && syft scan hugo-bin -o cyclonedx-json=hugo-bin.cdx.json -q'
           RC=$?
@@ -88,29 +115,22 @@ jobs:
           python3 - <<'PY'
           import json, base64, os
           cell = "${{ matrix.cell.name }}"
-          rc = "${{ steps.run.outputs.cilock_exit }}"
-          wall = "${{ steps.run.outputs.wall_seconds }}"
-          res = {"cell": cell, "cilock_exit": rc, "wall_seconds": wall}
+          res = {"cell": cell,
+                 "cilock_exit": "${{ steps.run.outputs.cilock_exit }}",
+                 "wall_seconds": "${{ steps.run.outputs.wall_seconds }}"}
+          keys = ["fanotifyEventsHashed","fanotifyCacheSkips","fanotifyIgnoreMarksAdded",
+                  "fanotifyIgnoreMarkErrors","fanotifyTimeouts","fanotifyQueueOverflows",
+                  "ringbufOpenatDrops","ringbufReadTapDrops","hashFailureSilentDrops",
+                  "partialReadFallbacks","fallbackHashFailures","cacheReadsSkipped","bytesHashed"]
           try:
               d = json.load(open("build.att.json")); p = json.loads(base64.b64decode(d["payload"]))
               ats = {a["type"]: a["attestation"] for a in p["predicate"]["attestations"]}
               pr = ats.get("https://aflock.ai/attestations/product/v0.3", {})
               res["product_treeSize"] = pr.get("treeSize")
-              cr = ats.get("https://aflock.ai/attestations/command-run/v0.1", {})
-              s = cr.get("summary", {})
-              res["diagnostics"] = s.get("diagnostics", {})
-              res["bytesHashed"] = s.get("diagnostics", {}).get("bytesHashed")
+              diag = ats.get("https://aflock.ai/attestations/command-run/v0.1", {}).get("summary", {}).get("diagnostics", {})
+              res["diagnostics"] = {k: diag.get(k, 0) for k in keys}
           except Exception as e:
               res["att_error"] = str(e)
-          leaves = []
-          try:
-              t = json.load(open("build.att.product.tree.json"))
-              leaves = sorted(l["path"].split("/")[-1] for l in t["leaves"])
-          except Exception:
-              pass
-          res["product_leaves"] = leaves
-          res["has_hugo_bin"] = "hugo-bin" in leaves
-          res["has_cdx"] = "hugo-bin.cdx.json" in leaves
           json.dump(res, open(f"result-{cell}.json","w"), indent=2)
           print(json.dumps(res, indent=2))
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
