@@ -21,7 +21,7 @@ permissions:
 
 env:
   CILOCK_URL: https://github.com/colek42/hugo/releases/download/cilock-demo/cilock-linux-amd64
-  CILOCK_SHA256: bdb8b4778946dccfa93810ed85ee72dc3d3fcc3a1cdeb76a77b168c745fd0f8a
+  CILOCK_SHA256: e34af417cd4094c5076a1b94c8d54b219ac26b28e24f181f418fcfb1fe36861e
 
 jobs:
   experiment:
@@ -31,15 +31,15 @@ jobs:
       fail-fast: false
       matrix:
         cell:
-          # Write-tap ablation: read-tap is now off by default; test whether
-          # the write-tap is ALSO redundant for PRODUCTS (Hugo emits two
-          # shapes: hugo-bin via atomic rename, hugo-bin.cdx.json via direct
-          # write). Hypothesis (confirmed locally, digest-verified): fanotify
-          # FAN_CLOSE_WRITE + survivor-walk + exists-at-exit capture both with
-          # correct content, so write-tap can be deleted with the whole
-          # shared read_tap_events ring. writetap: ""=on, "off"=disabled.
-          - { name: writetap_on,  writetap: "" }
-          - { name: writetap_off, writetap: "off" }
+          # openat-hash ablation: read+write taps already proven dead. Now
+          # test whether the eBPF openat-time content hash is also redundant
+          # with fanotify. Locally fanotify-only was a strictly CLEANER
+          # subset (lost 0 real content; the openat-hash's only unique
+          # entries were dir/device junk it wrongly hashed). Confirm on the
+          # heavier Hugo build: materials must lose no real files and products
+          # must stay intact (treeSize 2). openat_hash: ""=on, "off"=disabled.
+          - { name: openat_hash_on,  openat_hash: "" }
+          - { name: openat_hash_off, openat_hash: "off" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -87,7 +87,7 @@ jobs:
         run: |
           set -uo pipefail
           ENVV=( "PATH=$PATH" "HOME=$HOME" )
-          [ -n "${{ matrix.cell.writetap }}" ] && ENVV+=( "CILOCK_EBPF_WRITETAP=${{ matrix.cell.writetap }}" )
+          [ -n "${{ matrix.cell.openat_hash }}" ] && ENVV+=( "CILOCK_EBPF_OPENAT_HASH=${{ matrix.cell.openat_hash }}" )
           START=$(date +%s.%N)
           sudo env "${ENVV[@]}" \
             cilock run --step build --workload manual \
