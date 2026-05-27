@@ -27,7 +27,7 @@ permissions:
 
 env:
   CILOCK_URL: https://github.com/colek42/hugo/releases/download/cilock-demo/cilock-linux-amd64
-  CILOCK_SHA256: 47212bf267bba07701c8134047d06738043ef284258c98b6dd52e20205d0fd30
+  CILOCK_SHA256: dc1df016d29bbbcd247d62ac6ec345dffb5d16ea7303dbe45b53f665c0ef88fd
 
 jobs:
   experiment:
@@ -37,13 +37,13 @@ jobs:
       fail-fast: false
       matrix:
         cell:
-          # ignore_once: ""=default-on, "0"=disabled. unlimited: ""/"1".
-          # ev/rt ringbuf bytes: ""=compiled-in. zero_drops: ""/"--require-zero-drops".
-          - { name: default,           ignore_once: "",  unlimited: "",  ev: "", rt: "", hardening: standard, zero_drops: "" }
-          - { name: ignore_off,        ignore_once: "0", unlimited: "",  ev: "", rt: "", hardening: standard, zero_drops: "" }
-          - { name: unlimited_q,       ignore_once: "",  unlimited: "1", ev: "", rt: "", hardening: standard, zero_drops: "" }
-          - { name: ringbuf_small,     ignore_once: "",  unlimited: "",  ev: "16777216", rt: "67108864", hardening: standard, zero_drops: "" }
-          - { name: strict_zero_drops, ignore_once: "",  unlimited: "1", ev: "", rt: "", hardening: strict,   zero_drops: "--require-zero-drops" }
+          # Read-tap ablation (ignore-once default-on in both). Tests whether
+          # the eBPF read-tap is net-negative: local runs showed it adds ~93%
+          # cache/temp NOISE to materials + non-determinism + partial-read
+          # fallbacks + the 1GiB ring, for ~27 legit GOROOT mmap reads.
+          # readtap: ""=on (default), "off"=disabled.
+          - { name: readtap_on,  readtap: "" }
+          - { name: readtap_off, readtap: "off" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -90,17 +90,12 @@ jobs:
         id: run
         run: |
           set -uo pipefail
-          # Build the per-cell env list, omitting empties so unset means
-          # "cilock default" (ignore-once on, unlimited off, compiled-in ringbufs).
           ENVV=( "PATH=$PATH" "HOME=$HOME" )
-          [ -n "${{ matrix.cell.ignore_once }}" ] && ENVV+=( "CILOCK_FANO_IGNORE_ONCE=${{ matrix.cell.ignore_once }}" )
-          [ -n "${{ matrix.cell.unlimited }}" ]   && ENVV+=( "CILOCK_FANO_UNLIMITED_QUEUE=${{ matrix.cell.unlimited }}" )
-          [ -n "${{ matrix.cell.ev }}" ]          && ENVV+=( "CILOCK_EBPF_EVENTS_RINGBUF_BYTES=${{ matrix.cell.ev }}" )
-          [ -n "${{ matrix.cell.rt }}" ]          && ENVV+=( "CILOCK_EBPF_READTAP_RINGBUF_BYTES=${{ matrix.cell.rt }}" )
+          [ -n "${{ matrix.cell.readtap }}" ] && ENVV+=( "CILOCK_EBPF_READTAP=${{ matrix.cell.readtap }}" )
           START=$(date +%s.%N)
           sudo env "${ENVV[@]}" \
             cilock run --step build --workload manual \
-              --trace --capture-mode trace:ebpf --hardening ${{ matrix.cell.hardening }} ${{ matrix.cell.zero_drops }} \
+              --trace --capture-mode trace:ebpf --hardening standard \
               -a environment,git,go-build,slsa,sbom -k cilock.key -o build.att.json \
               -- bash -c 'go build -trimpath -ldflags=-buildid= -o hugo-bin . && syft scan hugo-bin -o cyclonedx-json=hugo-bin.cdx.json -q'
           RC=$?
@@ -127,10 +122,27 @@ jobs:
               ats = {a["type"]: a["attestation"] for a in p["predicate"]["attestations"]}
               pr = ats.get("https://aflock.ai/attestations/product/v0.3", {})
               res["product_treeSize"] = pr.get("treeSize")
+              res["material_treeSize"] = ats.get("https://aflock.ai/attestations/material/v0.3", {}).get("treeSize")
               diag = ats.get("https://aflock.ai/attestations/command-run/v0.1", {}).get("summary", {}).get("diagnostics", {})
               res["diagnostics"] = {k: diag.get(k, 0) for k in keys}
           except Exception as e:
               res["att_error"] = str(e)
+          # Categorize the material leaves so we can see whether the read-tap
+          # is adding legit inputs or cache/temp NOISE.
+          try:
+              t = json.load(open("build.att.material.tree.json"))
+              import collections
+              cat = collections.Counter()
+              for lf in t.get("leaves", []):
+                  x = lf.get("path","")
+                  if "/pkg/mod/" in x or "/go-build" in x or "/.cache/" in x: cat["gocache_modcache"] += 1
+                  elif x.startswith("/tmp/"): cat["tmp"] += 1
+                  elif x.startswith("/proc/") or x.startswith("/sys/"): cat["procsys"] += 1
+                  elif "/go/" in x or x.endswith(".go") or "/pkg/include/" in x: cat["goroot_src"] += 1
+                  else: cat["other"] += 1
+              res["material_categories"] = dict(cat)
+          except Exception as e:
+              res["material_cat_error"] = str(e)
           json.dump(res, open(f"result-{cell}.json","w"), indent=2)
           print(json.dumps(res, indent=2))
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
