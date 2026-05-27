@@ -123,15 +123,35 @@ jobs:
               res["diagnostics"] = {k: diag.get(k, 0) for k in keys}
           except Exception as e:
               res["att_error"] = str(e)
-          # Products are the load-bearing artifacts: capture leaf path→digest
-          # so we can confirm write-tap-off still produces BOTH Hugo product
-          # shapes with the SAME content.
           try:
               t = json.load(open("build.att.product.tree.json"))
               res["product_leaves"] = {lf["path"].split("/")[-1]: lf.get("fileDigest")
                                        for lf in t.get("leaves", [])}
           except Exception as e:
               res["product_leaves_error"] = str(e)
+          # Classify MATERIAL leaves by stat: are openat-hash's extra materials
+          # real content files, or non-regular junk (dirs/devices) fanotify
+          # correctly excludes? This is the decision for dropping the openat-hash.
+          try:
+              import os as _os, stat as _stat, collections as _c
+              t = json.load(open("build.att.material.tree.json"))
+              cat = _c.Counter()
+              samples = {"regfile": [], "dir": [], "other": []}
+              for lf in t.get("leaves", []):
+                  pth = lf.get("path", "")
+                  try:
+                      m = _os.lstat(pth).st_mode
+                      if _stat.S_ISREG(m): k = "regfile"
+                      elif _stat.S_ISDIR(m): k = "dir"
+                      else: k = "other"
+                  except Exception:
+                      k = "missing"
+                  cat[k] += 1
+                  if k in samples and len(samples[k]) < 8: samples[k].append(pth)
+              res["material_stat_categories"] = dict(cat)
+              res["material_samples"] = samples
+          except Exception as e:
+              res["material_cat_error"] = str(e)
           json.dump(res, open(f"result-{cell}.json","w"), indent=2)
           print(json.dumps(res, indent=2))
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
