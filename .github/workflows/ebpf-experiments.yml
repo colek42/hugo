@@ -21,7 +21,7 @@ permissions:
 
 env:
   CILOCK_URL: https://github.com/colek42/hugo/releases/download/cilock-demo/cilock-linux-amd64
-  CILOCK_SHA256: e34af417cd4094c5076a1b94c8d54b219ac26b28e24f181f418fcfb1fe36861e
+  CILOCK_SHA256: ae5f8bdc7a168b7480ee9827de43b58ad2c083bcc62b53c25e4056ee18d03175
 
 jobs:
   experiment:
